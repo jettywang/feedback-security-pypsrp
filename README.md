@@ -239,6 +239,38 @@ Here are the options that can be used to configure a `RunspacePool` shell;
 * `session_key_timeout_ms`: The maximum time to wait for a session key transfer from the server
 * `no_profile`: Do not load the user profile on the remote Runspace Pool
 
+#### Host Call Policy
+
+A remote script can issue host calls back to the client even when there is no
+user present to answer them. When running pypsrp as an unattended service this
+can be used to block on an interactive prompt or collect credentials. Pass a
+`pypsrp.host.HostCallPolicy` to `PSHost` to control which host call methods are
+allowed to run.
+
+* `HostCallPolicy.unattended()` is the safe default for services: normal output
+  methods (`Write*`, `WriteProgress`, etc.) are allowed while `ReadLine`,
+  `ReadLineAsSecureString`, `Prompt`, `PromptForCredential*`, `PromptForChoice`,
+  `ReadKey` and any unknown method are denied.
+* A denied method never runs. Methods that return a value receive a host
+  response carrying an `ErrorRecord` (`HostCallDenied`) with the same call id so
+  the server can match the rejection; denied void methods receive no response.
+* Custom policies accept `allow` and `deny` lists of
+  `HostMethodIdentifier` values (deny always wins) and an `allow_unlisted`
+  flag. Every denial is recorded on `policy.denied_calls` for auditing.
+
+```python
+from pypsrp.host import PSHost, PSHostUserInterface, HostCallPolicy
+
+host = PSHost(
+    None, None, False, "unattended", None,
+    PSHostUserInterface(), "1.0",
+    host_call_policy=HostCallPolicy.unattended(),
+)
+```
+
+When no policy is supplied every host method is allowed, preserving the
+previous behaviour.
+
 ### Process
 
 There are two process objects that can be used, `pypsrp.shell.Process` for the

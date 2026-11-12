@@ -2,6 +2,7 @@
 # MIT License (see LICENSE or https://opensource.org/licenses/MIT)
 
 import logging
+import threading
 import typing
 import uuid
 import xml.etree.ElementTree as ET
@@ -19,9 +20,258 @@ from pypsrp.complex_objects import (
     PSCredential,
     Size,
 )
+from pypsrp.exceptions import HostCallDeniedError
 from pypsrp.powershell import PowerShell, RunspacePool
 
 log = logging.getLogger(__name__)
+
+
+# Host method identifier values as defined in [MS-PSRP] 2.2.3.17.
+HMI_SET_SHOULD_EXIT = 6
+HMI_ENTER_NESTED_PROMPT = 7
+HMI_EXIT_NESTED_PROMPT = 8
+HMI_NOTIFY_BEGIN_APPLICATION = 9
+HMI_NOTIFY_END_APPLICATION = 10
+HMI_READ_LINE = 11
+HMI_READ_LINE_AS_SECURE_STRING = 12
+HMI_WRITE1 = 13
+HMI_WRITE2 = 14
+HMI_WRITE_LINE1 = 15
+HMI_WRITE_LINE2 = 16
+HMI_WRITE_LINE3 = 17
+HMI_WRITE_ERROR_LINE = 18
+HMI_WRITE_DEBUG_LINE = 19
+HMI_WRITE_PROGRESS = 20
+HMI_WRITE_VERBOSE_LINE = 21
+HMI_WRITE_WARNING_LINE = 22
+HMI_PROMPT = 23
+HMI_PROMPT_FOR_CREDENTIAL1 = 24
+HMI_PROMPT_FOR_CREDENTIAL2 = 25
+HMI_PROMPT_FOR_CHOICE = 26
+HMI_SET_FOREGROUND_COLOR = 28
+HMI_SET_BACKGROUND_COLOR = 30
+HMI_SET_CURSOR_POSITION = 32
+HMI_SET_WINDOW_POSITION = 34
+HMI_SET_CURSOR_SIZE = 36
+HMI_SET_BUFFER_SIZE = 38
+HMI_SET_WINDOW_SIZE = 40
+HMI_SET_WINDOW_TITLE = 42
+HMI_READ_KEY = 46
+HMI_FLUSH_INPUT_BUFFER = 47
+HMI_SET_BUFFER_CONTENTS2 = 48
+HMI_SET_BUFFER_CONTENTS1 = 49
+HMI_SCROLL_BUFFER_CONTENTS = 51
+
+
+# Host method identifiers that do not return a value (see
+# [MS-PSRP] 2.2.3.17). A denied call to one of these does not get a host
+# response message as there is nothing for the server to wait on.
+VOID_HOST_METHODS = frozenset(
+    [
+        HMI_SET_SHOULD_EXIT,
+        HMI_ENTER_NESTED_PROMPT,
+        HMI_EXIT_NESTED_PROMPT,
+        HMI_NOTIFY_BEGIN_APPLICATION,
+        HMI_NOTIFY_END_APPLICATION,
+        HMI_WRITE1,
+        HMI_WRITE2,
+        HMI_WRITE_LINE1,
+        HMI_WRITE_LINE2,
+        HMI_WRITE_LINE3,
+        HMI_WRITE_ERROR_LINE,
+        HMI_WRITE_DEBUG_LINE,
+        HMI_WRITE_PROGRESS,
+        HMI_WRITE_VERBOSE_LINE,
+        HMI_WRITE_WARNING_LINE,
+        HMI_SET_FOREGROUND_COLOR,
+        HMI_SET_BACKGROUND_COLOR,
+        HMI_SET_CURSOR_POSITION,
+        HMI_SET_WINDOW_POSITION,
+        HMI_SET_CURSOR_SIZE,
+        HMI_SET_BUFFER_SIZE,
+        HMI_SET_WINDOW_SIZE,
+        HMI_SET_WINDOW_TITLE,
+        HMI_FLUSH_INPUT_BUFFER,
+        HMI_SET_BUFFER_CONTENTS1,
+        HMI_SET_BUFFER_CONTENTS2,
+        HMI_SCROLL_BUFFER_CONTENTS,
+    ]
+)
+
+
+# Every host method identifier defined by [MS-PSRP] 2.2.3.17 that this
+# library is aware of. Anything outside this set is unknown.
+KNOWN_HOST_METHODS = frozenset(
+    HostMethodIdentifier(value=None)._string_map.keys()
+)
+
+
+def _method_value(method_identifier: typing.Union[int, HostMethodIdentifier]) -> int:
+    if isinstance(method_identifier, HostMethodIdentifier):
+        return method_identifier.value or 0
+    return int(method_identifier)
+
+
+class HostCallPolicy(object):
+    """
+    Controls which host call methods the client is willing to run on behalf of
+    the remote server. This is useful for an unattended service where the
+    remote script is still able to issue host calls but must not be able to
+    block on interactive prompts, collect credentials or invoke methods the
+    client does not know about.
+
+    Method identifiers use the values of
+    pypsrp.complex_objects.HostMethodIdentifier.
+
+    :param allow: Explicit set of method identifiers that are permitted.
+    :param deny: Explicit set of method identifiers that are blocked. A deny
+        entry always wins over an allow entry.
+    :param allow_unlisted: Whether a known method identifier that appears in
+        neither allow nor deny is permitted. Unknown identifiers are always
+        denied regardless of this value.
+    """
+
+    #: Methods that only produce output and never wait on user input. These are
+    #: safe for an unattended service and form the default allow list.
+    UNATTENDED_OUTPUT_METHODS = frozenset(
+        [
+            HMI_WRITE1,
+            HMI_WRITE2,
+            HMI_WRITE_LINE1,
+            HMI_WRITE_LINE2,
+            HMI_WRITE_LINE3,
+            HMI_WRITE_ERROR_LINE,
+            HMI_WRITE_DEBUG_LINE,
+            HMI_WRITE_PROGRESS,
+            HMI_WRITE_VERBOSE_LINE,
+            HMI_WRITE_WARNING_LINE,
+        ]
+    )
+
+    #: Interactive methods that read input, collect credentials or ask the user
+    #: to make a choice. These are blocked by default.
+    INTERACTIVE_METHODS = frozenset(
+        [
+            HMI_READ_LINE,
+            HMI_READ_LINE_AS_SECURE_STRING,
+            HMI_PROMPT,
+            HMI_PROMPT_FOR_CREDENTIAL1,
+            HMI_PROMPT_FOR_CREDENTIAL2,
+            HMI_PROMPT_FOR_CHOICE,
+            HMI_READ_KEY,
+        ]
+    )
+
+    def __init__(
+        self,
+        allow: typing.Optional[typing.Iterable[typing.Union[int, HostMethodIdentifier]]] = None,
+        deny: typing.Optional[typing.Iterable[typing.Union[int, HostMethodIdentifier]]] = None,
+        allow_unlisted: bool = True,
+    ) -> None:
+        self.allow = frozenset(_method_value(m) for m in (allow or []))
+        self.deny = frozenset(_method_value(m) for m in (deny or []))
+        self.allow_unlisted = allow_unlisted
+        self._lock = threading.RLock()
+        self._denied_calls: typing.List[typing.Tuple[int, str]] = []
+
+    @classmethod
+    def unattended(
+        cls,
+        allow: typing.Optional[typing.Iterable[typing.Union[int, HostMethodIdentifier]]] = None,
+        deny: typing.Optional[typing.Iterable[typing.Union[int, HostMethodIdentifier]]] = None,
+    ) -> "HostCallPolicy":
+        """
+        Create a policy suited to an unattended service. Normal output methods
+        are allowed while interactive prompts (including password and
+        credential prompts) and unknown methods are denied.
+
+        :param allow: Extra method identifiers to permit on top of the output
+            methods.
+        :param deny: Extra method identifiers to block. Deny entries win over
+            the default and custom allow entries.
+        :return: The configured HostCallPolicy.
+        """
+        allowed = set(cls.UNATTENDED_OUTPUT_METHODS)
+        allowed.update(_method_value(m) for m in (allow or []))
+        denied = set(cls.INTERACTIVE_METHODS)
+        denied.update(_method_value(m) for m in (deny or []))
+        return cls(allow=allowed, deny=denied, allow_unlisted=False)
+
+    @staticmethod
+    def is_known_method(method_identifier: typing.Union[int, HostMethodIdentifier]) -> bool:
+        """Whether the identifier maps to a host method pypsrp understands."""
+        return _method_value(method_identifier) in KNOWN_HOST_METHODS
+
+    @staticmethod
+    def is_void_method(method_identifier: typing.Union[int, HostMethodIdentifier]) -> bool:
+        """Whether the method does not return a value to the server."""
+        return _method_value(method_identifier) in VOID_HOST_METHODS
+
+    def is_allowed(
+        self,
+        method_identifier: typing.Union[int, HostMethodIdentifier],
+    ) -> bool:
+        """
+        Check whether a host call method is permitted by this policy.
+
+        :param method_identifier: The HostMethodIdentifier (or its int value)
+            from the host call message.
+        :return: True if the method may run, False if it must be denied.
+        """
+        value = _method_value(method_identifier)
+
+        if value in self.deny:
+            allowed = False
+        elif value in self.allow:
+            allowed = True
+        elif not self.is_known_method(value):
+            allowed = False
+        else:
+            allowed = self.allow_unlisted
+
+        if not allowed:
+            self._record_denial(value)
+        return allowed
+
+    def check_allowed(
+        self,
+        method_identifier: typing.Union[int, HostMethodIdentifier],
+    ) -> None:
+        """
+        Raise a HostCallDeniedError when the method is blocked by the policy.
+
+        :param method_identifier: The HostMethodIdentifier (or its int value)
+            from the host call message.
+        """
+        value = _method_value(method_identifier)
+        if not self.is_allowed(value):
+            reason = self.denial_reason(value)
+            raise HostCallDeniedError(value, reason)
+
+    def denial_reason(
+        self,
+        method_identifier: typing.Union[int, HostMethodIdentifier],
+    ) -> str:
+        """Return a human readable reason explaining a denial."""
+        value = _method_value(method_identifier)
+        if not self.is_known_method(value):
+            return "unknown or unsupported host method"
+        elif value in self.deny:
+            return "method is explicitly denied by the host call policy"
+        return "method is not on the host call policy allow list"
+
+    @property
+    def denied_calls(self) -> typing.List[typing.Tuple[int, str]]:
+        """
+        A list of (method identifier, reason) tuples for every call the policy
+        has denied. Useful for auditing what a remote script attempted to do.
+        """
+        with self._lock:
+            return list(self._denied_calls)
+
+    def _record_denial(self, value: int) -> None:
+        with self._lock:
+            self._denied_calls.append((value, self.denial_reason(value)))
 
 
 class PSHost(object):
@@ -34,6 +284,7 @@ class PSHost(object):
         private_data: typing.Optional[typing.Dict],
         ui: typing.Optional["PSHostUserInterface"],
         version: str,
+        host_call_policy: typing.Optional[HostCallPolicy] = None,
     ) -> None:
         """
         Defines the properties and facilities provided by an application
@@ -56,6 +307,10 @@ class PSHost(object):
         :param ui: The hosts implementation of PSHostUserInterface. Should be
             None if the host that does not want to support user interaction
         :param version: The version of the hosting application
+        :param host_call_policy: An optional HostCallPolicy that decides which
+            host call methods are allowed to run. When unset every method is
+            allowed which preserves the previous behaviour. Use
+            HostCallPolicy.unattended() for a safe unattended service default.
         """
         self.ui = ui
         self.debugger_enabled = debugger_enabled
@@ -67,6 +322,7 @@ class PSHost(object):
         self.instance_id = uuid.uuid4()
         self.current_culture = current_culture
         self.current_ui_culture = current_ui_culture
+        self.host_call_policy = host_call_policy
 
     def run_method(
         self,
@@ -93,6 +349,9 @@ class PSHost(object):
         """
         response = None
         mi = method_identifier.value or 0
+        if self.host_call_policy is not None:
+            self.host_call_policy.check_allowed(mi)
+
         if mi < 11:
             func = getattr(self, str(method_identifier))
             response = func(runspace, pipeline, *args)

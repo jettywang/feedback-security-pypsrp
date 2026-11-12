@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import logging
 import struct
+import threading
 import time
 import types
 import typing
@@ -26,6 +27,7 @@ from pypsrp.complex_objects import (
     CommandParameter,
     CommandType,
     ComplexObject,
+    ErrorRecord,
     HostInfo,
     ObjectMeta,
     Pipeline,
@@ -37,6 +39,7 @@ from pypsrp.complex_objects import (
 )
 from pypsrp.exceptions import (
     FragmentError,
+    HostCallDeniedError,
     InvalidPipelineStateError,
     InvalidPSRPOperation,
     InvalidRunspacePoolStateError,
@@ -180,6 +183,7 @@ class RunspacePool(object):
         self._key_exchanged = False
         self._new_client = False
         self._ci_counter = 0
+        self._host_call_lock = threading.RLock()
 
     @property
     def application_private_data(self) -> typing.Optional[ApplicationPrivateData]:
@@ -809,20 +813,93 @@ class RunspacePool(object):
             )
             return host_call
 
-        response = self.host.run_method(host_call.mi, host_call.mp, self, pipeline)
+        try:
+            response = self.host.run_method(host_call.mi, host_call.mp, self, pipeline)
+        except HostCallDeniedError as err:
+            log.warning(
+                "Host call method '%d' denied by host call policy: %s"
+                % (err.method_identifier, err.reason)
+            )
+            if not self.host.host_call_policy.is_void_method(err.method_identifier):
+                # Methods that return a value need a response carrying the
+                # same call id (ci) so the server can match the rejection to
+                # the call that made it.
+                self._send_host_response(
+                    response_obj,
+                    host_call,
+                    pipeline,
+                    mr=None,
+                    error=self._build_host_call_error(host_call, err),
+                )
+            return host_call
 
         if response is not None:
-            msg = response_obj()
-            msg.ci = host_call.ci
-            msg.mi = host_call.mi
-            msg.mr = response
+            self._send_host_response(response_obj, host_call, pipeline, mr=response)
 
-            pid = pipeline.id if pipeline is not None else None
+        return host_call
+
+    def _send_host_response(
+        self,
+        response_obj: typing.Union[typing.Type[RunspacePoolHostResponse], typing.Type[PipelineHostResponse]],
+        host_call: typing.Union[RunspacePoolHostCall, PipelineHostCall],
+        pipeline: typing.Optional["PowerShell"],
+        mr: typing.Any = None,
+        error: typing.Optional[ErrorRecord] = None,
+    ) -> None:
+        from pypsrp.host import HostCallPolicy
+
+        msg = response_obj()
+        msg.ci = host_call.ci
+        msg.mi = host_call.mi
+        msg.mr = mr
+        msg.me = error
+
+        # An unknown method identifier cannot be rendered to its enum name
+        # during serialization; keep the numeric value but make the name safe.
+        if not HostCallPolicy.is_known_method(msg.mi):
+            safe_string_map = dict(msg.mi._string_map)
+            safe_string_map[msg.mi.value] = "UnknownHostMethod"
+            msg.mi._string_map = safe_string_map
+
+        pid = pipeline.id if pipeline is not None else None
+        # Serializing and sending is not safe to interleave across threads so
+        # concurrent host calls share the same lock.
+        with self._host_call_lock:
             fragments = self._fragmenter.fragment(msg, self.id, pid)
             for fragment in fragments:
                 self.shell.send("pr", fragment)
 
-        return host_call
+    @staticmethod
+    def _build_host_call_error(
+        host_call: typing.Union[RunspacePoolHostCall, PipelineHostCall],
+        err: HostCallDeniedError,
+    ) -> ErrorRecord:
+        from pypsrp.host import HostCallPolicy
+
+        method_value = err.method_identifier
+        method_name = (
+            str(host_call.mi)
+            if HostCallPolicy.is_known_method(method_value)
+            else "Unknown(%d)" % method_value
+        )
+        message = (
+            "The host call method '%s' was rejected by the client host call "
+            "policy: %s" % (method_name, err.reason)
+        )
+        error = ErrorRecord(
+            fq_error="HostCallDenied",
+            category=7,  # ErrorCategory.PermissionDenied
+            reason=err.reason,
+            target_name="HostMethodIdentifier:%d" % method_value,
+            message=message,
+            details_message=message,
+        )
+        # ErrorRecord's constructor does not set every optional extended
+        # property attribute; provide the missing ones so it can serialize.
+        error.target_object = None
+        error.invocation_info = None
+        error.script_stacktrace = None
+        return error
 
     def _process_session_capability(
         self,

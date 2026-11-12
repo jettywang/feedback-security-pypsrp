@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+* Added `HostCallPolicy` to control which host call methods a `PSHost` is willing to run, including an `unattended()` preset that allows normal output but denies interactive prompts, credential collection and unknown methods
+  * A denied method that returns a value is answered with a `HostCallDenied` error record using the same host call id; denied void methods send no response and every denial is recorded on `policy.denied_calls`
+
 ## 0.9.1 - 2026-03-16
 
 * Fix recursion issue when generating requests HTTP adapter on each new connection

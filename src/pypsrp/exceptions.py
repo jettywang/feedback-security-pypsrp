@@ -160,3 +160,27 @@ class FragmentError(WinRMError):
 class SerializationError(WinRMError):
     # Any error during the serialization process
     pass
+
+
+class HostCallDeniedError(WinRMError):
+    # Raised when a host call method is blocked by the configured host call
+    # policy, e.g. when running in an unattended service that must not answer
+    # interactive prompts.
+
+    @property
+    def method_identifier(self):
+        return self.args[0]
+
+    @property
+    def reason(self):
+        return self.args[1]
+
+    @property
+    def message(self):
+        return "Host call method '%s' was denied by the host call policy: %s" % (
+            self.method_identifier,
+            self.reason,
+        )
+
+    def __str__(self):
+        return self.message
