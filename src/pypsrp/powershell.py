@@ -39,6 +39,7 @@ from pypsrp.exceptions import (
     FragmentError,
     InvalidPipelineStateError,
     InvalidPSRPOperation,
+    InvalidRunspacePoolConnectionError,
     InvalidRunspacePoolStateError,
     WSManFaultError,
 )
@@ -311,6 +312,14 @@ class RunspacePool(object):
                 self.state, RunspacePoolState.DISCONNECTED, "connect to a disconnected Runspace Pool"
             )
 
+        if not self.shell.resource_uri:
+            # Fail closed: without a bound resource URI the ShellId could be
+            # replayed against the wrong endpoint on the same host.
+            raise InvalidRunspacePoolConnectionError(
+                "Cannot connect to the Runspace Pool: no resource URI is bound to the disconnected shell, the "
+                "target endpoint cannot be verified"
+            )
+
         if self._new_client:
             log.debug("Remote Runspace Pool was created with a different client, connecting as new client")
             self._connect_new_client()
@@ -320,14 +329,28 @@ class RunspacePool(object):
             self._connect_existing_client()
 
     def _connect_existing_client(self) -> None:
-        selector_set = SelectorSet()
-        selector_set.add_option("ShellId", self.shell.id or "")
+        if not self.shell.id:
+            raise InvalidRunspacePoolConnectionError(
+                "Cannot reconnect to the Runspace Pool: no ShellId is associated with the disconnected shell"
+            )
+
+        # Prefer the authoritative selector set returned when the shell was
+        # created and fall back to the ShellId only when it was never provided.
+        selector_set = self.shell._selector_set
+        if selector_set is None:
+            selector_set = SelectorSet()
+            selector_set.add_option("ShellId", self.shell.id)
 
         self.connection.reconnect(self.shell.resource_uri, selector_set=selector_set)
         self.state = RunspacePoolState.OPENED
 
     def _connect_new_client(self) -> None:
         rsp = NAMESPACES["rsp"]
+        if not self.shell.id:
+            raise InvalidRunspacePoolConnectionError(
+                "Cannot connect to the Runspace Pool: no ShellId is associated with the enumerated shell"
+            )
+
         session_capability = SessionCapability(PROTOCOL_VERSION, PS_VERSION, SERIALIZATION_VERSION)
         connect_runspace = ConnectRunspacePool()
         data = self._fragmenter.fragment(session_capability, self.id)[0]
@@ -343,6 +366,9 @@ class RunspacePool(object):
         open_content = ET.SubElement(connect, "connectXml", xmlns="http://schemas.microsoft.com/powershell")
         open_content.text = base64.b64encode(data).decode("utf-8")
 
+        # The resource URI here identifies the exact endpoint (e.g. a JEA
+        # constrained endpoint) this shell belongs to. It was bound from the
+        # enumeration response and must not be replaced by another endpoint.
         response = self.connection.connect(self.shell.resource_uri, connect, options, selectors)
         response_xml = response.find("rsp:ConnectResponse/pwsh:connectResponseXml", NAMESPACES)
         fragments = base64.b64decode(response_xml.text)  # type: ignore[arg-type, union-attr] # Mandated by spec
@@ -462,6 +488,7 @@ class RunspacePool(object):
     @staticmethod
     def get_runspace_pools(
         connection: WSMan,
+        resource_uri: typing.Optional[str] = None,
     ) -> typing.List["RunspacePool"]:
         """
         Queries the server for disconnected runspace pools and creates a list
@@ -470,9 +497,21 @@ class RunspacePool(object):
         in the Disconnected state and can be connected to the server by calling
         the connect() method on the runspace pool.
 
+        The ShellId of every enumerated shell is bound to the resource URI the
+        server reports for that shell. A shell that is missing its ShellId or
+        resource URI, or whose resource URI does not match the optional
+        ``resource_uri`` filter, is rejected instead of being reconnected to a
+        different endpoint on the same host (for example a normal
+        Microsoft.PowerShell endpoint being mistaken for a constrained JEA
+        endpoint).
+
         :param connection: The connection object used to query the remote
             server for a list of Runspace Pools. Currently only
             pypsrp.wsman.WSMan is supported.
+        :param resource_uri: When set, only disconnected shells whose reported
+            resource URI matches this value are returned. Use this to pin the
+            enumeration to a specific endpoint, for example
+            ``http://schemas.microsoft.com/powershell/MyJEAEndpoint``.
         :return: List<RunspacePool> objects each in the Disconnected state
         """
         log.info("Getting list of Runspace Pools on remote host")
@@ -488,12 +527,51 @@ class RunspacePool(object):
         shells = response.findall("wsen:EnumerateResponse/wsman:Items/rsp:Shell", NAMESPACES)
 
         runspace_pools = []
+        # Track every ShellId returned by the server. A ShellId mapped to more
+        # than one resource URI is ambiguous and must not be reconnected.
+        shell_id_uris: typing.Dict[str, typing.Set[str]] = {}
         for shell in shells:
-            shell_id: str = shell.find("rsp:ShellId", NAMESPACES).text  # type: ignore # Mandated by spec
+            shell_id_et = shell.find("rsp:ShellId", NAMESPACES)
+            shell_id = shell_id_et.text if shell_id_et is not None else None
+            resource_uri_et = shell.find("rsp:ResourceUri", NAMESPACES)
+            shell_resource_uri = resource_uri_et.text if resource_uri_et is not None else None
+
+            if not shell_id:
+                raise InvalidRunspacePoolConnectionError(
+                    "Rejected disconnected shell enumeration entry: the server returned a shell without a "
+                    "ShellId, the shell cannot be safely reconnected"
+                )
+            if not shell_resource_uri:
+                raise InvalidRunspacePoolConnectionError(
+                    "Rejected disconnected shell '%s': the server did not report a ResourceUri, so it cannot be "
+                    "bound to its original endpoint" % shell_id
+                )
+            if resource_uri is not None and shell_resource_uri != resource_uri:
+                # Not the endpoint the caller asked for; skip rather than
+                # reconnect it through the wrong resource URI.
+                log.debug(
+                    "Skipping disconnected shell '%s' as its resource URI '%s' does not match the requested "
+                    "endpoint '%s'" % (shell_id, shell_resource_uri, resource_uri)
+                )
+                continue
+
+            shell_id_uris.setdefault(shell_id, set()).add(shell_resource_uri)
+            if len(shell_id_uris[shell_id]) > 1:
+                raise InvalidRunspacePoolConnectionError(
+                    "Rejected disconnected shell '%s': the server reported the same ShellId for multiple "
+                    "resource URIs (%s), the target endpoint is ambiguous"
+                    % (shell_id, ", ".join(sorted(shell_id_uris[shell_id])))
+                )
+
             pool = RunspacePool(connection)
+            # Bind the enumerated shell back to the endpoint the server says it
+            # belongs to. This URI is reused unchanged on the Connect/Reconnect
+            # and subsequent Command/Send requests.
             pool.id = shell_id
             pool.shell.id = shell_id
+            pool.shell.resource_uri = shell_resource_uri
             pool.shell.opened = True
+            pool.shell._selector_set = RunspacePool._parse_shell_selector_set(shell)
             pool._new_client = True
 
             # Seems like the server sends all pools not just disconnected but
@@ -526,6 +604,30 @@ class RunspacePool(object):
             pool.pipelines = pipelines
             runspace_pools.append(pool)
         return runspace_pools
+
+    @staticmethod
+    def _parse_shell_selector_set(shell: ET.Element) -> SelectorSet:
+        """
+        Extracts the authoritative selector set from an enumerated shell.
+
+        Newer hosts include the endpoint-relative reference parameters (which
+        contain the ShellId selector) under
+        wsa:ReferenceParameters/wsman:SelectorSet. When present those selectors
+        are used verbatim, otherwise a ShellId only selector set is built so
+        reconnect requests still target the correct shell.
+        """
+        selector_set = SelectorSet()
+        reference_selectors = shell.find("wsa:ReferenceParameters/wsman:SelectorSet", NAMESPACES)
+        if reference_selectors is not None:
+            for selector in reference_selectors.findall("wsman:Selector", NAMESPACES):
+                name = selector.attrib.get("Name")
+                if name:
+                    selector_set.add_option(name, selector.text or "")
+        else:
+            shell_id_et = shell.find("rsp:ShellId", NAMESPACES)
+            shell_id = shell_id_et.text if shell_id_et is not None else ""
+            selector_set.add_option("ShellId", shell_id or "")
+        return selector_set
 
     def open(
         self,

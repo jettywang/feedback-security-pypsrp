@@ -152,6 +152,14 @@ class InvalidPSRPOperation(WinRMError):
     pass
 
 
+class InvalidRunspacePoolConnectionError(WinRMError):
+    # Used when a disconnected shell discovered through WSMan enumeration
+    # cannot be safely bound to the resource URI (endpoint) it was originally
+    # created on. This prevents an ambiguous or mismatched enumeration result
+    # from being reconnected to a different endpoint on the same host.
+    pass
+
+
 class FragmentError(WinRMError):
     # Any error occurred during the packet fragmentation
     pass
