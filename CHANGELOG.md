@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+* Fixed `SecureString` output not being decrypted when it was received in the same buffer as the `ENCRYPTED_SESSION_KEY` message that completed the key exchange
+
 ## 0.9.1 - 2026-03-16
 
 * Fix recursion issue when generating requests HTTP adapter on each new connection

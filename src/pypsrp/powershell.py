@@ -744,8 +744,6 @@ class RunspacePool(object):
         responses: bytes,
         pipeline: typing.Optional["PowerShell"] = None,
     ) -> typing.List[typing.Tuple[int, typing.Any]]:
-        messages = self._fragmenter.defragment(responses)
-
         response_functions: typing.Dict[int, typing.Optional[typing.Callable[[Message], typing.Any]]] = {
             # While the docs say we should verify, they are out of date with
             # the possible responses and so we will just ignore for now
@@ -778,7 +776,13 @@ class RunspacePool(object):
             response_functions.update(pipeline_response_functions)
 
         return_values = []
-        for message in messages:
+        for payload in self._fragmenter.defragment_raw(responses):
+            # Unpack and process each message in order so that any state set
+            # by an earlier message, like the cipher from an
+            # ENCRYPTED_SESSION_KEY message, is in place when the messages
+            # that follow it in the same buffer are deserialised.
+            message = Message.unpack(payload, self._serializer)
+
             if message.message_type not in response_functions:
                 log.warning("Unsupported message type '%s' received" % message.message_type)
                 response_function = None
@@ -1706,6 +1710,13 @@ class Fragmenter(object):
         self,
         data: bytes,
     ) -> typing.List[Message]:
+        messages = [Message.unpack(fragment, self.serializer) for fragment in self.defragment_raw(data)]
+        return messages
+
+    def defragment_raw(
+        self,
+        data: bytes,
+    ) -> typing.List[bytes]:
         fragments = []
         while data != b"":
             frag, data = Fragment.unpack(data)
@@ -1732,8 +1743,7 @@ class Fragmenter(object):
                 incoming_buffer["data"] += frag.data
                 incoming_buffer["id"] += 1
 
-        messages = [Message.unpack(fragment, self.serializer) for fragment in fragments]
-        return messages
+        return fragments
 
     def _byte_iterator(
         self,
