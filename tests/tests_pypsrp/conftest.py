@@ -12,6 +12,7 @@ import yaml
 
 from pypsrp._utils import to_bytes, to_string
 from pypsrp.exceptions import AuthenticationError, WinRMTransportError
+from pypsrp.messages import MessageType
 from pypsrp.powershell import Fragment
 from pypsrp.wsman import NAMESPACES, WSMan
 
@@ -126,7 +127,77 @@ class TransportFake(object):
         if "timeout" in current_msg.keys():
             time.sleep(current_msg["timeout"])
 
+        response = self._normalise_response_fragments(response)
         return response
+
+    def _normalise_response_fragments(self, response_xml):
+        # The recorded responses use fixed, real runspace/pipeline ids while the
+        # client ids are mocked to the blank uuid during a test run. The client
+        # now routes PSRP messages strictly by the rpid/pid in each header so
+        # the response fragments are rewritten to the blank uuid values, which
+        # matches what a server echoes for the mocked client identifiers.
+        if not response_xml:
+            return response_xml
+
+        response_obj = ET.fromstring(to_bytes(response_xml))
+
+        # Only Receive responses carry streams. Raw WinRS cmd shells use the
+        # same structure but contain plain text, so a stream is only touched
+        # when it fully parses as a sequence of well formed PSRP fragments.
+        receive_streams = response_obj.findall("s:Body/rsp:ReceiveResponse/rsp:Stream", NAMESPACES)
+        if not receive_streams:
+            return response_xml
+
+        blank_guid = uuid.UUID("00000000-0000-0000-0000-000000000000").bytes_le
+        known_message_types = set(getattr(MessageType, attr) for attr in dir(MessageType) if attr.isupper())
+
+        changed = False
+        for stream in receive_streams:
+            if stream.text is None or stream.attrib.get("Name") != "stdout":
+                continue
+
+            try:
+                raw = base64.b64decode(stream.text.encode("utf-8"), validate=True)
+            except ValueError:
+                continue
+
+            # Walk the stream as real PSRP fragments. A stream is only treated
+            # as PSRP when every fragment parses cleanly and carries a known
+            # PSRP message type, which excludes raw WinRS text and binary file
+            # transfer payloads that merely happen to match the framing lengths.
+            parsed_fragments = []
+            probe_idx = 0
+            while probe_idx < len(raw):
+                try:
+                    frag, _ = Fragment.unpack(raw[probe_idx:])
+                except struct.error:
+                    parsed_fragments = []
+                    break
+                message_type = struct.unpack("<I", frag.data[4:8])[0] if len(frag.data) >= 8 else None
+                if message_type not in known_message_types:
+                    parsed_fragments = []
+                    break
+                parsed_fragments.append(frag)
+                probe_idx += 21 + len(frag.data)
+
+            if not parsed_fragments or probe_idx != len(raw):
+                continue
+
+            rebuilt = b""
+            for frag in parsed_fragments:
+                payload = bytearray(frag.data)
+                if len(payload) >= 40:
+                    # destination (4) + message type (4) then rpid (16) + pid (16)
+                    payload[8:24] = blank_guid
+                    payload[24:40] = blank_guid
+                rebuilt += Fragment(frag.object_id, frag.fragment_id, bytes(payload), frag.start, frag.end).pack()
+
+            stream.text = base64.b64encode(rebuilt).decode("utf-8")
+            changed = True
+
+        if changed:
+            return to_string(ET.tostring(response_obj, encoding="utf-8"))
+        return response_xml
 
     def _normalise_xml(self, xml, generify=True, overrides=None, psrp_fragment_type=None):
         if not xml:

@@ -89,6 +89,7 @@ PROTOCOL_VERSION = "2.3"
 PS_VERSION = "2.0"
 SERIALIZATION_VERSION = "1.1.0.1"
 DEFAULT_CONFIGURATION_NAME = "Microsoft.PowerShell"
+EMPTY_UUID = "00000000-0000-0000-0000-000000000000"
 
 
 class RunspacePoolWarning(Warning):
@@ -746,7 +747,7 @@ class RunspacePool(object):
     ) -> typing.List[typing.Tuple[int, typing.Any]]:
         messages = self._fragmenter.defragment(responses)
 
-        response_functions: typing.Dict[int, typing.Optional[typing.Callable[[Message], typing.Any]]] = {
+        runspace_response_functions: typing.Dict[int, typing.Optional[typing.Callable[[Message], typing.Any]]] = {
             # While the docs say we should verify, they are out of date with
             # the possible responses and so we will just ignore for now
             MessageType.SESSION_CAPABILITY: self._process_session_capability,
@@ -761,30 +762,83 @@ class RunspacePool(object):
             MessageType.WARNING_RECORD: self._process_runspacepool_warning,
         }
 
-        if pipeline is not None:
-            pipeline_response_functions: typing.Dict[int, typing.Optional[typing.Callable[[Message], typing.Any]]] = {
-                # The Pipeline Output isn't processes and just returned back to
-                # the receive caller
-                MessageType.PIPELINE_OUTPUT: None,
-                MessageType.ERROR_RECORD: pipeline._process_error_record,
-                MessageType.PIPELINE_STATE: pipeline._process_pipeline_state,
-                MessageType.DEBUG_RECORD: pipeline._process_debug_record,
-                MessageType.VERBOSE_RECORD: pipeline._process_verbose_record,
-                MessageType.WARNING_RECORD: pipeline._process_warning_record,
-                MessageType.PROGRESS_RECORD: pipeline._process_progress_record,
-                MessageType.INFORMATION_RECORD: pipeline._process_information_record,
-                MessageType.PIPELINE_HOST_CALL: pipeline._process_pipeline_host_call,
-            }
-            response_functions.update(pipeline_response_functions)
-
         return_values = []
         for message in messages:
-            if message.message_type not in response_functions:
-                log.warning("Unsupported message type '%s' received" % message.message_type)
-                response_function = None
+            # Every PSRP message carries the runspace pool id (rpid) and the
+            # pipeline id (pid) in its header. A single Receive response can
+            # contain fragments for multiple pipelines so the destination of a
+            # message must be derived from its own header and not the pipeline
+            # that issued the Receive request. This stops data for a stopped or
+            # closed pipeline leaking into another pipeline that is still
+            # running.
+            message_rpid = str(message.rpid).upper()
+            message_pid = str(message.pid).upper()
+
+            # A mismatched rpid indicates a message that was never intended for
+            # this runspace pool. It is logged explicitly so the anomaly stays
+            # visible while routing continues below based on the pid.
+            if message_rpid != EMPTY_UUID and message_rpid != self.id.upper():
+                log.warning(
+                    "Received PSRP message type '%s' with runspace pool id '%s' that does not match the "
+                    "current runspace pool id '%s'" % (message.message_type, message_rpid, self.id.upper())
+                )
+
+            target_pipeline: typing.Optional["PowerShell"] = None
+            if message_pid != EMPTY_UUID:
+                target_pipeline = self.pipelines.get(message_pid)
+            elif pipeline is not None:
+                # A blank pid means the message is not scoped to a specific
+                # pipeline (older servers and some negotiation traffic). Only
+                # in that case is it safe to attribute it to the pipeline that
+                # issued the Receive request.
+                target_pipeline = pipeline
+
+            response_function: typing.Optional[typing.Callable[[Message], typing.Any]]
+            if target_pipeline is None:
+                response_function = runspace_response_functions.get(message.message_type)
+                if response_function is None:
+                    # A pipeline scoped message with no live pipeline to own it
+                    # cannot be delivered anywhere safely. Discard it explicitly
+                    # rather than attaching it to an unrelated pipeline. This is
+                    # what protects a running pipeline from late results of a
+                    # stopped/closed pipeline which has been removed from the
+                    # registry.
+                    if message_pid != EMPTY_UUID:
+                        log.warning(
+                            "Discarding PSRP message type '%s' for unknown or stopped pipeline '%s'"
+                            % (message.message_type, message_pid)
+                        )
+                    else:
+                        log.warning("Unsupported message type '%s' received" % message.message_type)
+                    return_values.append((message.message_type, message))
+                    continue
 
             else:
-                response_function = response_functions[message.message_type]
+                pipeline_response_functions: typing.Dict[
+                    int, typing.Optional[typing.Callable[[Message], typing.Any]]
+                ] = {
+                    MessageType.ERROR_RECORD: target_pipeline._process_error_record,
+                    MessageType.PIPELINE_STATE: target_pipeline._process_pipeline_state,
+                    MessageType.DEBUG_RECORD: target_pipeline._process_debug_record,
+                    MessageType.VERBOSE_RECORD: target_pipeline._process_verbose_record,
+                    MessageType.WARNING_RECORD: target_pipeline._process_warning_record,
+                    MessageType.PROGRESS_RECORD: target_pipeline._process_progress_record,
+                    MessageType.INFORMATION_RECORD: target_pipeline._process_information_record,
+                    MessageType.PIPELINE_HOST_CALL: target_pipeline._process_pipeline_host_call,
+                }
+                response_function = pipeline_response_functions.get(message.message_type)
+
+                if message.message_type == MessageType.PIPELINE_OUTPUT:
+                    # Output is appended straight to the owning pipeline's
+                    # output collection, no handler is required.
+                    target_pipeline.output.append(message.data.data)
+                elif response_function is None:
+                    log.warning(
+                        "Discarding unsupported PSRP message type '%s' for pipeline '%s'"
+                        % (message.message_type, message_pid)
+                    )
+                    return_values.append((message.message_type, message))
+                    continue
 
             if response_function is not None:
                 return_value = response_function(message)
@@ -1483,22 +1537,23 @@ class PowerShell(object):
         """
         Poll the running process to update the output streams and the status.
 
+        Output and stream records are routed to the owning pipeline inside
+        :meth:`RunspacePool._parse_responses` based on the PSRP pipeline id in
+        each message header, so data from another pipeline can never be
+        appended here.
+
         :param timeout: Override the default WSMan timeout when polling the
         pipeline.
         """
         try:
-            responses = self.runspace_pool._receive(self.id, timeout=timeout)
+            self.runspace_pool._receive(self.id, timeout=timeout)
         except WSManFaultError as err:
             # operation timeout needs to be ignored and silently tried
             # again
             if err.code == 2150858793:
-                responses = []
+                pass
             else:
                 raise err
-
-        for response in responses:
-            if response[0] == MessageType.PIPELINE_OUTPUT:
-                self.output.append(response[1].data.data)
 
     def stop(self) -> None:
         """
@@ -1715,8 +1770,15 @@ class Fragmenter(object):
                 self.incoming_buffer[frag.object_id] = incoming_buffer
 
             if frag.fragment_id != incoming_buffer["id"]:
+                # A duplicate, retransmitted or missing fragment means the
+                # sequence for this object id can no longer be reassembled
+                # reliably. Drop any partial buffer so a stale half message
+                # cannot be merged into a future message that reuses the state,
+                # then fail loudly instead of silently corrupting the stream.
+                self.incoming_buffer.pop(frag.object_id, None)
                 raise FragmentError(
-                    "Fragment Fragment Id: %d != Expected Fragment Id: %d" % (frag.fragment_id, incoming_buffer["id"])
+                    "Fragment Fragment Id: %d != Expected Fragment Id: %d"
+                    % (frag.fragment_id, incoming_buffer["id"])
                 )
 
             if frag.start and frag.end:

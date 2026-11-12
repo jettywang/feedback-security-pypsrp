@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 
 import logging
+import struct
 import time
+import uuid
 import warnings
+import xml.etree.ElementTree as ET
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -30,12 +33,14 @@ from pypsrp.messages import (
     Message,
     MessageType,
     PipelineInput,
+    PipelineState,
     RunspacePoolHostCall,
     RunspacePoolStateMessage,
     UserEvent,
     WarningRecord,
 )
 from pypsrp.powershell import (
+    EMPTY_UUID,
     Fragment,
     Fragmenter,
     PowerShell,
@@ -1500,3 +1505,229 @@ class TestFragmenter(object):
         with pytest.raises(FragmentError) as err:
             fragmenter.defragment(fragments[1])
         assert str(err.value) == "Fragment Fragment Id: 2 != Expected Fragment Id: 1"
+
+
+class TestConcurrentPipelineRouting(object):
+    """Synthetic WSMan responses for two pipelines sharing one runspace pool.
+
+    These tests bypass the network entirely by feeding raw PSRP fragments into
+    ``RunspacePool._parse_responses`` (via a stubbed ``shell.receive``). They
+    verify that messages are routed by their own rpid/pid headers and that data
+    belonging to a stopped/closed pipeline can never be delivered to the other
+    pipeline that is still running.
+    """
+
+    ERROR_XML = (
+        '<Obj RefId="0"><TN RefId="0"><T>System.Management.Automation.ErrorRecord</T>'
+        "<T>System.Object</T></TN><ToString>{msg}</ToString>"
+        '<MS><B N="SerializeExtendedInfo">false</B><S N="FullyQualifiedErrorId">ErrorId</S>'
+        '<I32 N="ErrorCategory_Category">1</I32></MS></Obj>'
+    )
+
+    @staticmethod
+    def _message_bytes(pool, message_type, rpid, pid, payload=None):
+        if message_type == MessageType.PIPELINE_OUTPUT:
+            body = ET.tostring(pool._serializer.serialize(payload), encoding="utf-8", method="xml")
+        elif message_type == MessageType.ERROR_RECORD:
+            record = pool._serializer.deserialize(TestConcurrentPipelineRouting.ERROR_XML.format(msg=payload))
+            body = Message(Destination.CLIENT, rpid, pid, record, pool._serializer).pack()[40:]
+        else:
+            state = PipelineState(payload)
+            body = Message(Destination.CLIENT, rpid, pid, state, pool._serializer).pack()[40:]
+
+        header = struct.pack("<I", Destination.CLIENT) + struct.pack("<I", message_type)
+        header += uuid.UUID(rpid).bytes_le + uuid.UUID(pid).bytes_le
+        return header + body
+
+    @staticmethod
+    def _fragment(object_id, message_bytes, fragment_id=0, start=True, end=True):
+        return Fragment(object_id, fragment_id, message_bytes, start=start, end=end).pack()
+
+    def _build_pool(self, monkeypatch):
+        wsman = WSMan("")
+        pool = RunspacePool(wsman)
+        pool.state = RunspacePoolState.OPENED
+        pool.protocol_version = "2.3"
+
+        pipeline_a = PowerShell(pool)
+        pipeline_a.state = PSInvocationState.RUNNING
+        pipeline_a._command_id = pipeline_a.id
+        pipeline_b = PowerShell(pool)
+        pipeline_b.state = PSInvocationState.RUNNING
+        pipeline_b._command_id = pipeline_b.id
+        pool.pipelines[pipeline_a.id] = pipeline_a
+        pool.pipelines[pipeline_b.id] = pipeline_b
+
+        # Feed whatever raw fragments each test queues up, emulating a WSMan
+        # Receive response that can interleave data for both pipelines.
+        queue = {"data": b""}
+
+        def fake_receive(stream, command_id=None, timeout=None):
+            data = queue["data"]
+            queue["data"] = b""
+            return None, None, {"stdout": data}
+
+        monkeypatch.setattr(pool.shell, "receive", fake_receive)
+        return pool, pipeline_a, pipeline_b, queue
+
+    def test_normal_interleaved_messages_route_to_owning_pipeline(self, monkeypatch):
+        pool, pipeline_a, pipeline_b, queue = self._build_pool(monkeypatch)
+        rpid = pool.id
+
+        queue["data"] += self._fragment(
+            1, self._message_bytes(pool, MessageType.PIPELINE_OUTPUT, rpid, pipeline_a.id, "a-out")
+        )
+        queue["data"] += self._fragment(
+            2, self._message_bytes(pool, MessageType.PIPELINE_OUTPUT, rpid, pipeline_b.id, "b-out")
+        )
+        queue["data"] += self._fragment(
+            3, self._message_bytes(pool, MessageType.ERROR_RECORD, rpid, pipeline_b.id, "b-err")
+        )
+        queue["data"] += self._fragment(
+            4, self._message_bytes(pool, MessageType.PIPELINE_OUTPUT, rpid, pipeline_a.id, "a-out-2")
+        )
+
+        pipeline_b.poll_invoke()
+
+        assert pipeline_a.output == ["a-out", "a-out-2"]
+        assert pipeline_b.output == ["b-out"]
+        assert pipeline_a.streams.error == []
+        assert len(pipeline_b.streams.error) == 1
+        assert str(pipeline_b.streams.error[0]) == "b-err"
+
+    def test_stopped_pipeline_output_cannot_reach_running_pipeline(self, monkeypatch, caplog):
+        pool, pipeline_a, pipeline_b, queue = self._build_pool(monkeypatch)
+        rpid = pool.id
+
+        # Stop pipeline A: it is removed from the pool registry exactly like the
+        # real stop()/close() paths.
+        pipeline_a.state = PSInvocationState.STOPPED
+        pool.pipelines.pop(pipeline_a.id, None)
+
+        late_output = self._fragment(
+            1, self._message_bytes(pool, MessageType.PIPELINE_OUTPUT, rpid, pipeline_a.id, "late-a")
+        )
+        late_error = self._fragment(
+            2, self._message_bytes(pool, MessageType.ERROR_RECORD, rpid, pipeline_a.id, "late-a-err")
+        )
+        good_output = self._fragment(
+            3, self._message_bytes(pool, MessageType.PIPELINE_OUTPUT, rpid, pipeline_b.id, "b-out")
+        )
+        queue["data"] = late_output + late_error + good_output
+
+        with caplog.at_level(logging.WARNING, logger="pypsrp.powershell"):
+            pipeline_b.poll_invoke()
+
+        # The running pipeline must only ever see its own data.
+        assert pipeline_b.output == ["b-out"]
+        assert pipeline_b.streams.error == []
+        assert pipeline_a.output == []
+        assert pipeline_a.streams.error == []
+        assert any("unknown or stopped pipeline" in message for message in caplog.messages)
+
+    def test_unknown_pipeline_id_is_not_attributed_to_receiver(self, monkeypatch, caplog):
+        pool, pipeline_a, pipeline_b, queue = self._build_pool(monkeypatch)
+        rpid = pool.id
+        unknown_pid = str(uuid.uuid4()).upper()
+
+        queue["data"] = self._fragment(
+            1, self._message_bytes(pool, MessageType.PIPELINE_OUTPUT, rpid, unknown_pid, "stranger")
+        )
+        queue["data"] += self._fragment(
+            2, self._message_bytes(pool, MessageType.PIPELINE_OUTPUT, rpid, pipeline_b.id, "b-out")
+        )
+
+        with caplog.at_level(logging.WARNING, logger="pypsrp.powershell"):
+            pipeline_b.poll_invoke()
+
+        assert pipeline_b.output == ["b-out"]
+        assert pipeline_a.output == []
+        assert any(unknown_pid.lower() in message.lower() for message in caplog.messages)
+
+    def test_wrong_runspace_id_is_logged_but_pid_still_routes(self, monkeypatch, caplog):
+        pool, pipeline_a, pipeline_b, queue = self._build_pool(monkeypatch)
+        foreign_rpid = str(uuid.uuid4()).upper()
+
+        queue["data"] = self._fragment(
+            1, self._message_bytes(pool, MessageType.PIPELINE_OUTPUT, foreign_rpid, pipeline_b.id, "b-out")
+        )
+
+        with caplog.at_level(logging.WARNING, logger="pypsrp.powershell"):
+            pipeline_b.poll_invoke()
+
+        # The data is still attributed using the pid, but the rpid mismatch is
+        # surfaced explicitly instead of being silently accepted.
+        assert pipeline_b.output == ["b-out"]
+        assert pipeline_a.output == []
+        assert any(foreign_rpid.lower() in message.lower() for message in caplog.messages)
+        assert any("does not match the current runspace pool id" in message for message in caplog.messages)
+
+    def test_pipeline_state_for_other_pipeline_does_not_change_receiver(self, monkeypatch):
+        pool, pipeline_a, pipeline_b, queue = self._build_pool(monkeypatch)
+        rpid = pool.id
+
+        queue["data"] = self._fragment(
+            1,
+            self._message_bytes(pool, MessageType.PIPELINE_STATE, rpid, pipeline_a.id, PSInvocationState.COMPLETED),
+        )
+
+        pipeline_b.poll_invoke()
+
+        assert pipeline_a.state == PSInvocationState.COMPLETED
+        assert pipeline_b.state == PSInvocationState.RUNNING
+
+    def test_runspace_scoped_message_with_pipeline_receiver_still_processed(self, monkeypatch):
+        pool, pipeline_a, pipeline_b, queue = self._build_pool(monkeypatch)
+
+        state_message = RunspacePoolStateMessage(RunspacePoolState.OPENED)
+        packed = Message(Destination.CLIENT, EMPTY_UUID, EMPTY_UUID, state_message, pool._serializer).pack()
+        queue["data"] = self._fragment(1, packed)
+
+        pipeline_b.poll_invoke()
+        assert pool.state == RunspacePoolState.OPENED
+
+    def test_duplicate_fragment_id_raises_and_clears_partial_buffer(self):
+        serializer = Serializer()
+        fragmenter = Fragmenter(153600, serializer)
+        rpid = str(uuid.uuid4()).upper()
+        pid = str(uuid.uuid4()).upper()
+        holder = _SerializerHolder(serializer)
+        message = self._message_bytes(holder, MessageType.PIPELINE_OUTPUT, rpid, pid, "x")
+
+        first = self._fragment(1, message, fragment_id=0, start=True, end=False)
+        duplicate = self._fragment(1, message, fragment_id=0, start=True, end=False)
+
+        fragmenter.defragment(first)
+        with pytest.raises(FragmentError):
+            fragmenter.defragment(duplicate)
+
+        # The poisoned partial buffer must be gone so a fresh start fragment for
+        # the same object id can be reassembled without stale data leaking in.
+        assert 1 not in fragmenter.incoming_buffer
+        fresh_start = self._fragment(1, message[:5], fragment_id=0, start=True, end=False)
+        fragmenter.defragment(fresh_start)
+        assert fragmenter.incoming_buffer[1]["data"] == message[:5]
+
+    def test_missing_fragment_gap_raises_and_clears_partial_buffer(self):
+        serializer = Serializer()
+        fragmenter = Fragmenter(153600, serializer)
+        rpid = str(uuid.uuid4()).upper()
+        pid = str(uuid.uuid4()).upper()
+        holder = _SerializerHolder(serializer)
+        message = self._message_bytes(holder, MessageType.PIPELINE_OUTPUT, rpid, pid, "y")
+
+        start = self._fragment(7, message, fragment_id=0, start=True, end=False)
+        gap = self._fragment(7, message, fragment_id=2, start=False, end=True)
+
+        fragmenter.defragment(start)
+        with pytest.raises(FragmentError) as err:
+            fragmenter.defragment(gap)
+        assert "Expected Fragment Id: 1" in str(err.value)
+        assert 7 not in fragmenter.incoming_buffer
+
+
+class _SerializerHolder(object):
+    """Minimal stand-in exposing the serializer used by the test helpers."""
+
+    def __init__(self, serializer):
+        self._serializer = serializer

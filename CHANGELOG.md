@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+* Route PSRP messages using the runspace pool id and pipeline id in each message header instead of the pipeline that issued the Receive request, preventing output and error records from a stopped or closed pipeline being delivered to another still running pipeline
+* Discard and log pipeline scoped messages whose pipeline id is unknown or no longer tracked rather than attributing them to an unrelated pipeline
+* Clear a partial fragment buffer when a duplicate, retransmitted or out of sequence fragment is received so stale data cannot corrupt a later message
+
 ## 0.9.1 - 2026-03-16
 
 * Fix recursion issue when generating requests HTTP adapter on each new connection
